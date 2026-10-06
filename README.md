@@ -3,8 +3,9 @@
 Supabase project for Sikka: Postgres schema, Row Level Security, sync RPCs, new-account bootstrap and the receipts storage bucket. The mobile app lives in the separate **mobile** repo (`../mobile`).
 
 ```
-supabase/config.toml     Supabase CLI config (local dev; auth redirect URLs for sikka://)
+supabase/config.toml     Supabase CLI config (local dev, auth settings)
 supabase/migrations/     schema, RLS, RPCs, triggers, storage policies
+supabase/templates/      auth emails (6-digit codes for sign-up and password reset)
 supabase/tests/          integrity + RLS checks run against a throwaway Postgres
 ```
 
@@ -16,19 +17,21 @@ npx supabase link --project-ref <your-project-ref>
 npx supabase db push
 ```
 
-Then in the dashboard, under **Authentication → URL Configuration**, add these redirect URLs:
+Then set up the auth emails in the dashboard. The app confirms sign-ups and resets passwords with a **6-digit code** typed into the app, not a link: links can't return to an app running in Expo Go, because the auth server always rejects `exp://<LAN IP>` addresses.
 
-- `sikka://**`
-- `exp://**` (only while developing in Expo Go)
+1. **Authentication → Emails → Templates → Confirm signup**: set the subject to `Your Sikka confirmation code`, and set the body to the contents of [supabase/templates/confirmation.html](supabase/templates/confirmation.html).
+2. **Reset Password** template: set the subject to `Your Sikka password reset code`, and set the body to [supabase/templates/recovery.html](supabase/templates/recovery.html).
+3. **Authentication → Sign In / Providers → Email**: keep **Confirm email** on and **Email OTP Length** at 6.
 
-Optional: under **Authentication → Providers → Email**, turn off "Confirm email" if you want sign-up to log in immediately while testing.
+The built-in email sender allows only a few emails per hour. For real users, set up custom SMTP under **Authentication → Emails → SMTP Settings**.
 
-Give the mobile app the project URL and publishable key (Project Settings → API).
+Give the mobile app the project URL and publishable key (Project Settings → API Keys).
 
 ## Local development
 
 ```bash
 npx supabase start      # local stack in Docker; prints the URL and keys for the app's .env.local
+                        # auth emails (with codes) land in Mailpit, at the URL it prints
 npx supabase db reset   # re-apply migrations from scratch
 ```
 
