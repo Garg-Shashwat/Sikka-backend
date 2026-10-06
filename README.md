@@ -58,14 +58,23 @@ One `transactions` table for every type, with `transaction_payers` and `transact
 - A transaction stores a single `subcategory_id`. Each category has one `is_category_default` subcategory (name `NULL`) that means "the category itself", so "Food" and "Food → Restaurant" are both one id and a mismatched category/subcategory pair can't be stored.
 - **Groups** are saved selections of people. The app copies a group's _current_ members into a transaction's shares, so group changes never rewrite history. `transactions.group_id` records which group a transaction was entered under, which drives the group dashboard and group balances.
 - **People** are archived, never deleted (`deleted_at`); there is no delete policy, and foreign keys use `on delete restrict`.
-- `people.linked_user_id` is reserved for linking a Person to a real Sikka account later. It isn't used yet.
-- Every row has an `owner_user_id`. Phase 1 policies only allow the owner; future sharing can widen the policies without reshaping the data.
+- Every row has an `owner_user_id`: the account that created it. Categories, subcategories and tags are always private; new accounts get their own copy of the starter categories.
+
+## Sharing between accounts
+
+A shared ledger, like Splitwise ([migration](supabase/migrations/20261009000000_sharing.sql)):
+
+- **Who is who.** `people.linked_user_id` says which Sikka account a person is. Everyone's "Me" is linked to themselves. Other links are made only with consent through `public.links`: `request_link(person, email)` and the other side calls `accept_link(link, null, person)`, or `create_invite(person)` returns a code for `accept_link(null, code, person)`. On accepting, they choose which of *their* people the requester is (or create one), so both sides' past records connect. `decline_link` and `cancel_link` close requests. A trigger stops `linked_user_id` being set any other way.
+- **Records carry accounts.** `transaction_payers`, `transaction_shares` and `group_members` have a `user_id`, filled by trigger from the person. Apps map accounts onto their own people, so "Asha's Rahul" reads as "Me" on Rahul's phone.
+- **Visibility.** You can see a transaction if you created it, are a payer or share in it, or it is in a group you belong to; anyone who can see it can edit or delete it (`upsert_transaction`). Groups are visible to their members and edited only by their creator (`upsert_group`). People and categories that a visible transaction or group refers to are readable (not editable). Tags stay personal: each account sees only its own tags on a shared transaction.
+- **Merging.** `merge_people(from, into)` moves everything recorded for one of my people onto another and archives the first. A connection moves along with it.
+- **Newly visible history.** When something becomes visible (a link is accepted, someone joins a group), the affected rows get a fresh `updated_at` so incremental pulls pick them up. `visible_shared_ids()` lists the shared rows still visible, so apps can drop ones that no longer are (e.g. after leaving a group).
 
 ## Sync contract
 
 - IDs are UUIDs generated on the client, so retried writes are idempotent.
 - `updated_at` is always set by the server (trigger) and is the client's pull cursor. `pull_changes(p_since, p_limit)` returns changes for all tables in one call, using keyset paging on `(updated_at, id)`.
 - Deletions are `deleted_at` tombstones so they reach other devices.
-- `upsert_transaction(p jsonb)` and `upsert_group(p jsonb)` write a whole aggregate atomically: the row plus its payers, shares and tags, or its members. They run as `SECURITY INVOKER`, so RLS still applies.
+- `upsert_transaction(p jsonb)` and `upsert_group(p jsonb)` write a whole aggregate atomically: the row plus its payers, shares and the caller's tags, or its members. They are `SECURITY DEFINER` with explicit permission checks (there are no direct-write policies on these tables).
 - New accounts get a `users` profile, a "Me" person and starter categories from the `on_auth_user_created` trigger.
-- Tables are in the `supabase_realtime` publication so other devices get notified to pull.
+- Tables are in the `supabase_realtime` publication so other devices get notified to pull. Realtime applies RLS, so apps subscribe without an owner filter and also hear about shared rows and connection requests.
