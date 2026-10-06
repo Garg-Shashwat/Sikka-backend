@@ -12,10 +12,23 @@
 -- * Still private per account: categories, tags (each person tags shared expenses their own way),
 --   and people/groups that nothing shared refers to. Categories and people that a shared
 --   transaction refers to become readable (name/icon only) to the others involved.
+-- * People standing for an account can only be added to new expenses or groups by someone
+--   connected with that account (or inside a group it is already in). Every change to a
+--   transaction is recorded in transaction_history.
+-- * Either side can disconnect; requests are by verified email (never revealing whether an
+--   account exists), invite codes expire, and both are rate limited.
+-- * The profile copy of the email (public.users.email) can't be edited by users.
 -- * When something becomes newly visible (a link is accepted, someone is added to a group),
 --   the affected rows get a fresh updated_at so incremental pulls pick them up.
 -- * Writes to transactions, payers/shares and group members happen only through the RPCs below
 --   (SECURITY DEFINER with explicit checks), so there are no direct-write policies for them.
+
+-- ---------------------------------------------------------------------------
+-- Profiles: users may change their name and settings, not the email copy.
+-- ---------------------------------------------------------------------------
+
+revoke update on public.users from anon, authenticated;
+grant update (name, phone, avatar_url, default_currency) on public.users to authenticated;
 
 -- ---------------------------------------------------------------------------
 -- People ↔ accounts
@@ -26,16 +39,21 @@ update public.people set linked_user_id = owner_user_id where is_self and linked
 create unique index people_one_per_linked_user on public.people (owner_user_id, linked_user_id) where linked_user_id is not null;
 create index people_linked_user on public.people (linked_user_id) where linked_user_id is not null;
 
--- "Me" is always linked to its owner; any other link can only be set by the linking RPCs.
+-- "Me" is always linked to its owner, and stays "Me". Any other link can only be set inside the
+-- linking functions (SECURITY DEFINER, so they run as the function owner, not as the caller's
+-- API role). Requests through the API run as anon/authenticated and are refused.
 create or replace function public.guard_person_link()
 returns trigger
 language plpgsql
 set search_path = ''
 as $$
 begin
+  if tg_op = 'UPDATE' and new.is_self is distinct from old.is_self then
+    raise exception 'Me can''t be changed into someone else' using errcode = '42501';
+  end if;
   if new.is_self then
     new.linked_user_id := new.owner_user_id;
-  elsif coalesce(current_setting('sikka.linking', true), '') <> 'on'
+  elsif current_user in ('anon', 'authenticated')
         and new.linked_user_id is distinct from (case when tg_op = 'UPDATE' then old.linked_user_id end) then
     raise exception 'Connect people to accounts from the app''s connect screen' using errcode = '42501';
   end if;
@@ -102,7 +120,9 @@ set search_path = ''
 as $$
   select id from public.groups where owner_user_id = (select auth.uid())
   union
-  select group_id from public.group_members where user_id = (select auth.uid())
+  -- Members stop seeing a group (and expenses they're not part of) once its creator deletes it.
+  select m.group_id from public.group_members m join public.groups g on g.id = m.group_id
+  where m.user_id = (select auth.uid()) and g.deleted_at is null
 $$;
 
 create or replace function public.visible_transaction_ids()
@@ -297,6 +317,74 @@ create policy receipts_select on storage.objects for select to authenticated
 -- Writes
 -- ---------------------------------------------------------------------------
 
+-- Accounts I'm connected with (including myself): people I own that stand for an account.
+create or replace function public.connected_user_ids()
+returns setof uuid
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select linked_user_id from public.people
+  where owner_user_id = (select auth.uid()) and linked_user_id is not null
+$$;
+
+-- People standing for an account may only be added by someone connected with that account,
+-- or inside a group that account is already in. Stops a connected user dragging a third
+-- account (one they only know through someone else's records) into new expenses or groups.
+-- Returns the first person that isn't allowed, or null.
+create or replace function public.unconsented_person(p_people uuid[], p_keep uuid[], p_group uuid)
+returns uuid
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select p.id from public.people p
+  where p.id = any(p_people)
+    and p.linked_user_id is not null
+    and p.linked_user_id not in (select public.connected_user_ids())
+    and not (p.id = any(coalesce(p_keep, '{}')))
+    and not (p_group is not null and exists (
+      select 1 from public.group_members m where m.group_id = p_group and m.user_id = p.linked_user_id))
+  limit 1
+$$;
+
+-- Edit history of shared ledgers: who changed what, so edits by others are never silent.
+create table public.transaction_history (
+  id bigint generated always as identity primary key,
+  transaction_id uuid not null references public.transactions (id) on delete cascade,
+  changed_by uuid references public.users (id) on delete set null,
+  changed_at timestamptz not null default now(),
+  action text not null check (action in ('created', 'edited', 'deleted', 'restored')),
+  -- Amount, date, description, type, payers and shares before/after (notes are left out).
+  before jsonb,
+  after jsonb
+);
+
+create index transaction_history_tx on public.transaction_history (transaction_id, changed_at);
+
+alter table public.transaction_history enable row level security;
+create policy transaction_history_select on public.transaction_history for select to authenticated
+  using (public.can_see_transaction(transaction_id));
+
+create or replace function public.transaction_snapshot(p_id uuid)
+returns jsonb
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select jsonb_build_object(
+    'type', t.type, 'amount', t.amount, 'description', t.description, 'date', t.date,
+    'group_id', t.group_id, 'subcategory_id', t.subcategory_id, 'deleted', t.deleted_at is not null,
+    'payers', coalesce((select jsonb_agg(jsonb_build_object('person_id', x.person_id, 'user_id', x.user_id, 'amount', x.amount) order by x.person_id)
+                        from public.transaction_payers x where x.transaction_id = t.id), '[]'),
+    'shares', coalesce((select jsonb_agg(jsonb_build_object('person_id', x.person_id, 'user_id', x.user_id, 'amount', x.amount) order by x.person_id)
+                        from public.transaction_shares x where x.transaction_id = t.id), '[]'))
+  from public.transactions t where t.id = p_id
+$$;
+
 create or replace function public.upsert_transaction(p jsonb)
 returns void
 language plpgsql
@@ -309,15 +397,19 @@ declare
   v_sub uuid := (p ->> 'subcategory_id')::uuid;
   v_group uuid := (p ->> 'group_id')::uuid;
   v_refund uuid := (p ->> 'refund_of_id')::uuid;
-  v_owner uuid;
+  v_exists boolean;
   v_bad text;
+  v_people uuid[];
+  v_prev uuid[];
+  v_before jsonb;
+  v_after jsonb;
 begin
   if v_uid is null then
     raise exception 'Not authenticated' using errcode = '28000';
   end if;
 
-  select owner_user_id into v_owner from public.transactions where id = v_id;
-  if found and not public.can_see_transaction(v_id) then
+  v_exists := exists (select 1 from public.transactions where id = v_id);
+  if v_exists and not public.can_see_transaction(v_id) then
     raise exception 'Transaction % belongs to another user', v_id using errcode = '42501';
   end if;
 
@@ -331,12 +423,23 @@ begin
     raise exception 'Expense % is not available to you', v_refund using errcode = '42501';
   end if;
 
-  select x.person_id into v_bad
-  from jsonb_to_recordset(coalesce(p -> 'payers', '[]'::jsonb) || coalesce(p -> 'shares', '[]'::jsonb)) as x(person_id uuid)
-  where x.person_id not in (select public.visible_person_ids())
-  limit 1;
+  v_people := array(
+    select x.person_id
+    from jsonb_to_recordset(coalesce(p -> 'payers', '[]'::jsonb) || coalesce(p -> 'shares', '[]'::jsonb)) as x(person_id uuid));
+
+  select x into v_bad from unnest(v_people) as x where x not in (select public.visible_person_ids()) limit 1;
   if v_bad is not null then
     raise exception 'Person % is not available to you', v_bad using errcode = '42501';
+  end if;
+
+  -- People already on this transaction can stay; new ones must be connected to me (or in the group).
+  v_prev := array(
+    select person_id from public.transaction_payers where transaction_id = v_id
+    union select person_id from public.transaction_shares where transaction_id = v_id);
+  v_bad := public.unconsented_person(v_people, v_prev, v_group);
+  if v_bad is not null then
+    raise exception 'You can only add people you are connected with, or who are in this group'
+      using errcode = '42501';
   end if;
 
   select x.tag_id into v_bad
@@ -346,6 +449,8 @@ begin
   if v_bad is not null then
     raise exception 'Tag % is not yours', v_bad using errcode = '42501';
   end if;
+
+  v_before := case when v_exists then public.transaction_snapshot(v_id) end;
 
   insert into public.transactions as t (
     id, owner_user_id, type, amount, currency, subcategory_id, description, date, notes,
@@ -393,6 +498,20 @@ begin
     select distinct v_id, x.tag_id::uuid, v_uid
     from jsonb_array_elements_text(coalesce(p -> 'tag_ids', '[]'::jsonb)) as x(tag_id);
 
+  v_after := public.transaction_snapshot(v_id);
+  if v_before is distinct from v_after then
+    insert into public.transaction_history (transaction_id, changed_by, action, before, after)
+    values (
+      v_id, v_uid,
+      case
+        when v_before is null then 'created'
+        when (v_after ->> 'deleted')::boolean and not (v_before ->> 'deleted')::boolean then 'deleted'
+        when (v_before ->> 'deleted')::boolean and not (v_after ->> 'deleted')::boolean then 'restored'
+        else 'edited'
+      end,
+      v_before, v_after);
+  end if;
+
   -- Shared with other accounts: make sure they can pull the people and category it mentions.
   if v_group is not null or exists (
     select 1 from public.transaction_payers where transaction_id = v_id and user_id is not null and user_id <> v_uid
@@ -404,7 +523,8 @@ begin
 end;
 $$;
 
--- Groups are edited by their creator only. Members can be anyone visible to the creator.
+-- Groups are edited by their creator only. Members can be anyone visible to the creator; members
+-- that stand for an account must be connected to the creator (or already in the group).
 create or replace function public.upsert_group(p jsonb)
 returns void
 language plpgsql
@@ -416,6 +536,8 @@ declare
   v_id uuid := (p ->> 'id')::uuid;
   v_owner uuid;
   v_bad uuid;
+  v_members uuid[];
+  v_prev uuid[];
   v_before uuid[];
 begin
   if v_uid is null then
@@ -427,12 +549,14 @@ begin
     raise exception 'Group % belongs to another user', v_id using errcode = '42501';
   end if;
 
-  select x.person_id::uuid into v_bad
-  from jsonb_array_elements_text(coalesce(p -> 'member_ids', '[]'::jsonb)) as x(person_id)
-  where x.person_id::uuid not in (select public.visible_person_ids())
-  limit 1;
+  v_members := array(select distinct x::uuid from jsonb_array_elements_text(coalesce(p -> 'member_ids', '[]'::jsonb)) as x);
+  select x into v_bad from unnest(v_members) as x where x not in (select public.visible_person_ids()) limit 1;
   if v_bad is not null then
     raise exception 'Person % is not available to you', v_bad using errcode = '42501';
+  end if;
+  v_prev := array(select person_id from public.group_members where group_id = v_id);
+  if public.unconsented_person(v_members, v_prev, null) is not null then
+    raise exception 'You can only add people you are connected with' using errcode = '42501';
   end if;
 
   insert into public.groups as g (id, owner_user_id, name, emoji, color, created_at, deleted_at)
@@ -450,9 +574,7 @@ begin
   v_before := array(select user_id from public.group_members where group_id = v_id and user_id is not null);
 
   delete from public.group_members where group_id = v_id;
-  insert into public.group_members (group_id, person_id)
-    select distinct v_id, x.person_id::uuid
-    from jsonb_array_elements_text(coalesce(p -> 'member_ids', '[]'::jsonb)) as x(person_id);
+  insert into public.group_members (group_id, person_id) select v_id, x from unnest(v_members) as x;
 
   -- Someone newly in the group: they now see its history.
   if exists (
@@ -467,6 +589,22 @@ $$;
 -- ---------------------------------------------------------------------------
 -- Connecting accounts
 -- ---------------------------------------------------------------------------
+--
+-- A request is addressed to an email, not an account: it succeeds whether or not that email has
+-- a Sikka account (so nobody can probe which emails are registered), and the person sees it once
+-- they sign in with that verified email. Invite codes are one-time, short-lived bearer codes.
+-- Both are limited per account per day; wrong invite codes are limited per hour.
+
+-- My verified login email (never the editable profile copy).
+create or replace function public.my_email()
+returns text
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select lower(email) from auth.users where id = (select auth.uid()) and email_confirmed_at is not null
+$$;
 
 create table public.links (
   id uuid primary key default gen_random_uuid(),
@@ -475,25 +613,60 @@ create table public.links (
   from_person uuid not null references public.people (id) on delete cascade,
   from_name text not null default '',
   from_email text,
-  -- Who was asked (null for an invite code nobody has used yet), and their person for the asker.
+  -- Who was asked: an email for requests (to_user is filled in on accepting), nothing for codes.
   to_user uuid references public.users (id) on delete cascade,
   to_email text,
   to_person uuid references public.people (id) on delete set null,
   invite_code text unique,
-  status text not null default 'pending' check (status in ('pending', 'accepted', 'declined', 'cancelled')),
+  status text not null default 'pending'
+    check (status in ('pending', 'accepted', 'declined', 'cancelled', 'disconnected')),
+  expires_at timestamptz not null,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
 
 create index links_from_user on public.links (from_user, updated_at);
 create index links_to_user on public.links (to_user, updated_at);
+create index links_to_email on public.links (lower(to_email)) where status = 'pending';
 
 create trigger links_updated_at before insert or update on public.links
   for each row execute function public.set_updated_at();
 
 alter table public.links enable row level security;
 create policy links_select on public.links for select to authenticated
-  using (from_user = (select auth.uid()) or to_user = (select auth.uid()));
+  using (
+    from_user = (select auth.uid())
+    or to_user = (select auth.uid())
+    or (to_user is null and invite_code is null and lower(to_email) = (select public.my_email()))
+  );
+
+-- Failed attempts that must be limited even though the call itself returns normally.
+create table public.rate_events (
+  user_id uuid not null references public.users (id) on delete cascade,
+  kind text not null,
+  at timestamptz not null default now()
+);
+create index rate_events_user_kind_at on public.rate_events (user_id, kind, at);
+alter table public.rate_events enable row level security; -- no policies: only the functions below
+
+-- Requests + invites: at most 20 per day and 30 waiting at once, per account.
+create or replace function public.check_link_quota()
+returns void
+language plpgsql
+stable
+security definer
+set search_path = ''
+as $$
+begin
+  if (select count(*) from public.links where from_user = auth.uid() and created_at > now() - interval '1 day') >= 20 then
+    raise exception 'You have sent a lot of requests today. Try again tomorrow.' using errcode = '54000';
+  end if;
+  if (select count(*) from public.links
+      where from_user = auth.uid() and status = 'pending' and expires_at > now()) >= 30 then
+    raise exception 'Too many requests are waiting. Cancel some first.' using errcode = '54000';
+  end if;
+end;
+$$;
 
 -- The caller's own, unlinked, active person (not "Me").
 create or replace function public.linkable_person(p_person uuid)
@@ -526,27 +699,54 @@ set search_path = ''
 as $$
 declare
   v_uid uuid := auth.uid();
-  v_to uuid;
+  v_email text := lower(btrim(coalesce(p_email, '')));
+  v_mine text := public.my_email();
   v_id uuid;
 begin
   perform public.linkable_person(p_person);
-  select id into v_to from public.users where lower(email) = lower(btrim(p_email));
-  if v_to is null then
-    raise exception 'No Sikka account uses %. Share an invite code instead.', btrim(p_email) using errcode = 'P0002';
+  if v_mine is null then
+    raise exception 'Verify your email before connecting with others' using errcode = '42501';
   end if;
-  if v_to = v_uid then
+  if v_email !~ '^[^@\s]+@[^@\s]+\.[^@\s]+$' or length(v_email) > 254 then
+    raise exception 'Enter a valid email' using errcode = '22023';
+  end if;
+  if v_email = v_mine then
     raise exception 'That is your own email' using errcode = '22023';
   end if;
-  if exists (select 1 from public.people where owner_user_id = v_uid and linked_user_id = v_to) then
-    raise exception 'You are already connected with %', btrim(p_email) using errcode = '23505';
+  -- Only reveals something about accounts you are already connected with.
+  if exists (
+    select 1 from public.people p join auth.users u on u.id = p.linked_user_id
+    where p.owner_user_id = v_uid and lower(u.email) = v_email
+  ) then
+    raise exception 'You are already connected with %', v_email using errcode = '23505';
   end if;
+  if exists (
+    select 1 from public.links
+    where from_user = v_uid and lower(to_email) = v_email and status = 'declined' and updated_at > now() - interval '7 days'
+  ) then
+    raise exception '% declined recently. Try again in a few days.', v_email using errcode = '54000';
+  end if;
+  perform public.check_link_quota();
 
-  update public.links set status = 'cancelled' where from_person = p_person and status = 'pending';
-  insert into public.links (from_user, from_person, from_name, from_email, to_user, to_email)
-  select v_uid, p_person, u.name, u.email, v_to, btrim(p_email) from public.users u where u.id = v_uid
+  update public.links set status = 'cancelled'
+  where from_user = v_uid and status = 'pending' and (from_person = p_person or lower(to_email) = v_email);
+  insert into public.links (from_user, from_person, from_name, from_email, to_email, expires_at)
+  select v_uid, p_person, u.name, v_mine, v_email, now() + interval '30 days' from public.users u where u.id = v_uid
   returning id into v_id;
   return v_id;
 end;
+$$;
+
+-- 10 characters from an alphabet without look-alikes (no 0/O, 1/I/L): 31^10 ≈ 8 × 10^14 codes.
+-- Uses only the fully random bytes of a v4 uuid (bytes 6 and 8 carry version/variant bits).
+create or replace function public.new_invite_code()
+returns text
+language sql
+volatile
+set search_path = ''
+as $$
+  select string_agg(substr('ABCDEFGHJKMNPQRSTUVWXYZ23456789', (get_byte(b, i) % 31) + 1, 1), '' order by i)
+  from (select uuid_send(gen_random_uuid()) as b) r, unnest(array[0, 1, 2, 3, 4, 5, 9, 10, 11, 12]) as i
 $$;
 
 create or replace function public.create_invite(p_person uuid)
@@ -560,12 +760,14 @@ declare
   v_code text;
 begin
   perform public.linkable_person(p_person);
+  perform public.check_link_quota();
   update public.links set status = 'cancelled' where from_person = p_person and status = 'pending';
   loop
-    v_code := upper(substr(md5(gen_random_uuid()::text), 1, 8));
+    v_code := public.new_invite_code();
     begin
-      insert into public.links (from_user, from_person, from_name, from_email, invite_code)
-      select v_uid, p_person, u.name, u.email, v_code from public.users u where u.id = v_uid;
+      insert into public.links (from_user, from_person, from_name, from_email, invite_code, expires_at)
+      select v_uid, p_person, u.name, public.my_email(), v_code, now() + interval '7 days'
+      from public.users u where u.id = v_uid;
       return v_code;
     exception when unique_violation then
       -- try another code
@@ -575,15 +777,17 @@ end;
 $$;
 
 -- Accept a request (p_link) or an invite code (p_code). p_person: which of my people the other
--- account is; null creates a new person.
+-- account is; null creates a new person. Returns 'ok', or 'invalid_code' for a wrong/expired code
+-- (returned rather than raised so the failed attempt is recorded for rate limiting).
 create or replace function public.accept_link(p_link uuid default null, p_code text default null, p_person uuid default null)
-returns void
+returns text
 language plpgsql
 security definer
 set search_path = ''
 as $$
 declare
   v_uid uuid := auth.uid();
+  v_email text := public.my_email();
   v public.links;
   v_mine uuid;
   v_people uuid[];
@@ -594,16 +798,30 @@ begin
   end if;
 
   if p_link is not null then
-    select * into v from public.links where id = p_link and to_user = v_uid and status = 'pending' for update;
-  else
     select * into v from public.links
-    where invite_code = upper(btrim(coalesce(p_code, ''))) and status = 'pending' and to_user is null for update;
+    where id = p_link and status = 'pending' and expires_at > now() and invite_code is null
+      and (to_user = v_uid or (to_user is null and lower(to_email) = v_email))
+    for update;
+    if not found then
+      raise exception 'This request is no longer valid' using errcode = 'P0002';
+    end if;
+  else
+    if (select count(*) from public.rate_events
+        where user_id = v_uid and kind = 'bad_invite_code' and at > now() - interval '1 hour') >= 10 then
+      raise exception 'Too many wrong codes. Try again in an hour.' using errcode = '54000';
+    end if;
+    select * into v from public.links
+    where invite_code = upper(regexp_replace(coalesce(p_code, ''), '[^A-Za-z0-9]', '', 'g'))
+      and status = 'pending' and expires_at > now() and to_user is null
+    for update;
+    if not found then
+      insert into public.rate_events (user_id, kind) values (v_uid, 'bad_invite_code');
+      return 'invalid_code';
+    end if;
   end if;
-  if not found then
-    raise exception 'This request or code is no longer valid' using errcode = 'P0002';
-  end if;
+
   if v.from_user = v_uid then
-    raise exception 'That is your own invite code' using errcode = '22023';
+    raise exception 'That is your own invite' using errcode = '22023';
   end if;
   if exists (select 1 from public.people where owner_user_id = v_uid and linked_user_id = v.from_user)
      or exists (select 1 from public.people where owner_user_id = v.from_user and linked_user_id = v_uid) then
@@ -612,8 +830,6 @@ begin
   if (select linked_user_id from public.people where id = v.from_person) is not null then
     raise exception 'This request is no longer valid' using errcode = 'P0002';
   end if;
-
-  perform set_config('sikka.linking', 'on', true);
 
   if p_person is not null then
     perform public.linkable_person(p_person);
@@ -627,22 +843,33 @@ begin
   update public.people set linked_user_id = v_uid where id = v.from_person;
 
   update public.links
-  set status = 'accepted', to_user = v_uid, to_person = v_mine,
-      to_email = coalesce(to_email, (select email from public.users where id = v_uid))
+  set status = 'accepted', to_user = v_uid, to_person = v_mine, to_email = coalesce(to_email, v_email)
   where id = v.id;
 
   -- Existing records about these two people now stand for the two accounts.
   v_people := array[v.from_person, v_mine];
-  update public.transaction_payers set user_id = null where person_id = any(v_people); -- trigger refills
-  update public.transaction_shares set user_id = null where person_id = any(v_people);
-  update public.group_members set user_id = null where person_id = any(v_people);
+  perform public.refresh_people_accounts(v_people);
+  return 'ok';
+end;
+$$;
 
+-- After a person's account changes: recompute user_id on their rows and make the affected
+-- transactions and groups pull again for everyone who (still) sees them.
+create or replace function public.refresh_people_accounts(p_people uuid[])
+returns void
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  update public.transaction_payers set user_id = null where person_id = any(p_people); -- trigger refills
+  update public.transaction_shares set user_id = null where person_id = any(p_people);
+  update public.group_members set user_id = null where person_id = any(p_people);
   perform public.touch_transactions(array(
-    select transaction_id from public.transaction_payers where person_id = any(v_people)
-    union select transaction_id from public.transaction_shares where person_id = any(v_people)));
-  v_groups := array(select group_id from public.group_members where person_id = any(v_people));
-  perform public.touch_groups(v_groups);
-  update public.people set updated_at = now() where id = any(v_people);
+    select transaction_id from public.transaction_payers where person_id = any(p_people)
+    union select transaction_id from public.transaction_shares where person_id = any(p_people)));
+  perform public.touch_groups(array(select group_id from public.group_members where person_id = any(p_people)));
+  update public.people set updated_at = now() where id = any(p_people);
 end;
 $$;
 
@@ -652,7 +879,9 @@ language sql
 security definer
 set search_path = ''
 as $$
-  update public.links set status = 'declined' where id = p_link and to_user = auth.uid() and status = 'pending';
+  update public.links set status = 'declined', to_user = auth.uid()
+  where id = p_link and status = 'pending' and invite_code is null
+    and (to_user = auth.uid() or (to_user is null and lower(to_email) = public.my_email()));
 $$;
 
 create or replace function public.cancel_link(p_link uuid)
@@ -662,6 +891,86 @@ security definer
 set search_path = ''
 as $$
   update public.links set status = 'cancelled' where id = p_link and from_user = auth.uid() and status = 'pending';
+$$;
+
+-- On records owned by p_owner, replace person p_from with p_to (amounts of duplicates are added).
+create or replace function public.swap_person(p_owner uuid, p_from uuid, p_to uuid)
+returns void
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_txs uuid[];
+  v_groups uuid[];
+begin
+  if p_from is null or p_to is null or p_from = p_to then
+    return;
+  end if;
+  v_txs := array(
+    select t.id from public.transactions t
+    where t.owner_user_id = p_owner and (
+      exists (select 1 from public.transaction_payers x where x.transaction_id = t.id and x.person_id = p_from)
+      or exists (select 1 from public.transaction_shares x where x.transaction_id = t.id and x.person_id = p_from)));
+  v_groups := array(
+    select g.id from public.groups g
+    where g.owner_user_id = p_owner and exists (select 1 from public.group_members m where m.group_id = g.id and m.person_id = p_from));
+
+  insert into public.transaction_payers as x (transaction_id, person_id, amount)
+    select transaction_id, p_to, amount from public.transaction_payers where person_id = p_from and transaction_id = any(v_txs)
+  on conflict (transaction_id, person_id) do update set amount = x.amount + excluded.amount;
+  delete from public.transaction_payers where person_id = p_from and transaction_id = any(v_txs);
+  insert into public.transaction_shares as x (transaction_id, person_id, amount)
+    select transaction_id, p_to, amount from public.transaction_shares where person_id = p_from and transaction_id = any(v_txs)
+  on conflict (transaction_id, person_id) do update set amount = x.amount + excluded.amount;
+  delete from public.transaction_shares where person_id = p_from and transaction_id = any(v_txs);
+
+  insert into public.group_members (group_id, person_id)
+    select group_id, p_to from public.group_members where person_id = p_from and group_id = any(v_groups)
+  on conflict do nothing;
+  delete from public.group_members where person_id = p_from and group_id = any(v_groups);
+
+  perform public.touch_transactions(v_txs);
+  perform public.touch_groups(v_groups);
+end;
+$$;
+
+-- Stop sharing with an account (either side can do it). Both sides keep their own records, with
+-- the other person as a plain name; from now on neither sees the other's records.
+create or replace function public.disconnect(p_person uuid)
+returns void
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_uid uuid := auth.uid();
+  v_other uuid;
+  v_my_self uuid;
+  v_their_self uuid;
+  v_their_for_me uuid;
+  v_people uuid[];
+begin
+  select linked_user_id into v_other from public.people
+  where id = p_person and owner_user_id = v_uid and not is_self and linked_user_id is not null;
+  if v_other is null then
+    raise exception 'Not connected' using errcode = 'P0002';
+  end if;
+  select id into v_my_self from public.people where owner_user_id = v_uid and is_self;
+  select id into v_their_self from public.people where owner_user_id = v_other and is_self;
+  select id into v_their_for_me from public.people where owner_user_id = v_other and linked_user_id = v_uid;
+
+  -- Each side's own "Me" on the other side's records becomes the plain person standing for them.
+  perform public.swap_person(v_uid, v_their_self, p_person);
+  perform public.swap_person(v_other, v_my_self, v_their_for_me);
+
+  v_people := array_remove(array[p_person, v_their_for_me], null);
+  update public.people set linked_user_id = null where id = any(v_people);
+  update public.links set status = 'disconnected'
+  where status = 'accepted'
+    and ((from_user = v_uid and to_user = v_other) or (from_user = v_other and to_user = v_uid));
+  perform public.refresh_people_accounts(v_people);
+end;
 $$;
 
 -- Merge two of my people: everything recorded for p_from moves to p_into, then p_from is archived.
@@ -691,7 +1000,6 @@ begin
     raise exception '% and % are connected to different accounts', f.name, i.name using errcode = '22023';
   end if;
 
-  perform set_config('sikka.linking', 'on', true);
   if f.linked_user_id is not null and i.linked_user_id is null then
     update public.people set linked_user_id = null where id = p_from;
     update public.people set linked_user_id = f.linked_user_id where id = p_into;
@@ -719,15 +1027,10 @@ begin
   on conflict do nothing;
   delete from public.group_members where person_id = p_from;
 
-  -- Rows for p_into may have been written before it was connected.
-  update public.transaction_payers set user_id = null where person_id = p_into;
-  update public.transaction_shares set user_id = null where person_id = p_into;
-  update public.group_members set user_id = null where person_id = p_into;
-
   update public.people set deleted_at = now() where id = p_from;
+  perform public.refresh_people_accounts(array[p_into]);
   perform public.touch_transactions(v_txs);
   perform public.touch_groups(v_groups);
-  update public.people set updated_at = now() where id = p_into;
 end;
 $$;
 
@@ -819,7 +1122,8 @@ begin
             (select jsonb_agg(jsonb_build_object('tag_id', x.tag_id))
              from public.transaction_tags x where x.transaction_id = t.id and x.owner_user_id = $1), '[]'))$e$),
       ('attachments', 't.transaction_id in (select public.visible_transaction_ids())', 'to_jsonb(t)'),
-      ('links', '(t.from_user = $1 or t.to_user = $1)', 'to_jsonb(t)')
+      ('links', '(t.from_user = $1 or t.to_user = $1 or (t.to_user is null and t.invite_code is null and lower(t.to_email) = public.my_email()))',
+        $e$to_jsonb(t) - case when t.from_user = $1 then '' else 'invite_code' end$e$)
     ) as s(tbl, visible, expr)
   loop
     since_ts := (p_since -> spec.tbl ->> 'ts')::timestamptz;
@@ -847,7 +1151,7 @@ begin
 end;
 $$;
 
--- Realtime: requests and acceptances reach the other account immediately.
+-- Realtime: requests, acceptances and disconnects reach the other account immediately.
 do $$
 begin
   if exists (select 1 from pg_publication where pubname = 'supabase_realtime') then
@@ -861,6 +1165,15 @@ $$;
 -- ---------------------------------------------------------------------------
 
 revoke execute on function public.touch_transactions(uuid[]) from public, anon, authenticated;
+revoke execute on function public.refresh_people_accounts(uuid[]) from public, anon, authenticated;
+revoke execute on function public.swap_person(uuid, uuid, uuid) from public, anon, authenticated;
+revoke execute on function public.connected_user_ids() from public, anon, authenticated;
+revoke execute on function public.unconsented_person(uuid[], uuid[], uuid) from public, anon, authenticated;
+revoke execute on function public.transaction_snapshot(uuid) from public, anon, authenticated;
+revoke execute on function public.check_link_quota() from public, anon, authenticated;
+revoke execute on function public.new_invite_code() from public, anon, authenticated;
+revoke execute on function public.my_email() from public, anon;
+grant execute on function public.my_email() to authenticated; -- used by the links policy
 revoke execute on function public.touch_groups(uuid[]) from public, anon, authenticated;
 revoke execute on function public.linkable_person(uuid) from public, anon, authenticated;
 revoke execute on function public.fill_member_user() from public, anon, authenticated;
@@ -888,6 +1201,8 @@ revoke execute on function public.accept_link(uuid, text, uuid) from public, ano
 revoke execute on function public.decline_link(uuid) from public, anon;
 revoke execute on function public.cancel_link(uuid) from public, anon;
 revoke execute on function public.merge_people(uuid, uuid) from public, anon;
+revoke execute on function public.disconnect(uuid) from public, anon;
+grant execute on function public.disconnect(uuid) to authenticated;
 revoke execute on function public.visible_shared_ids() from public, anon;
 grant execute on function public.request_link(uuid, text) to authenticated;
 grant execute on function public.create_invite(uuid) to authenticated;

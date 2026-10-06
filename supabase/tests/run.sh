@@ -10,6 +10,6 @@ until docker exec sikka-pg-test pg_isready -U postgres >/dev/null 2>&1; do sleep
 sleep 2
 psql_() { docker exec -i sikka-pg-test psql -q -U postgres "$@"; }
 psql_ < 00_supabase_stub.sql
-for f in ../migrations/*.sql; do psql_ -v ON_ERROR_STOP=1 < "$f"; done
 psql_ < 01_grants.sql
+for f in ../migrations/*.sql; do psql_ -v ON_ERROR_STOP=1 < "$f"; done
 psql_ < 02_checks.sql 2>&1 | grep -v '^CONTEXT\|^PL/pgSQL'

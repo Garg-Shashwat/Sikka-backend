@@ -126,8 +126,8 @@ select upsert_transaction(jsonb_build_object('id','eeeeeeee-0000-0000-0000-00000
   'shares', jsonb_build_array(jsonb_build_object('person_id',:'me_id','amount',500), jsonb_build_object('person_id','aaaaaaaa-0000-0000-0000-000000000002','amount',500))));
 \echo EXPECT ERROR: setting linked_user_id directly
 update people set linked_user_id = '22222222-2222-2222-2222-222222222222' where id = 'aaaaaaaa-0000-0000-0000-000000000002';
-\echo EXPECT ERROR: request to an unknown email
-select request_link('aaaaaaaa-0000-0000-0000-000000000002', 'nobody@x.com');
+\echo request to an email without an account succeeds the same way (no account probing)
+select request_link('aaaaaaaa-0000-0000-0000-000000000002', 'nobody@x.com') is not null as sent_to_unknown_email;
 select request_link('aaaaaaaa-0000-0000-0000-000000000002', ' B@X.com ') as link_id \gset
 -- B: before accepting sees nothing of A's
 select set_config('request.jwt.claim.sub','22222222-2222-2222-2222-222222222222',false);
@@ -193,8 +193,8 @@ select accept_link(null, :'code', null);
 select set_config('request.jwt.claim.sub','33333333-3333-3333-3333-333333333333',false);
 select accept_link(null, lower(:'code'), null);
 select name as c_person_for_a from people where not is_self;
-\echo EXPECT ERROR: code already used
-select accept_link(null, :'code', null);
+\echo code already used: rejected (returned, so the attempt is counted)
+select accept_link(null, :'code', null) as reused_code;
 -- Merge: A had an older "Bunty (old)" with history; merging moves it to Bunty, so B sees it
 select set_config('request.jwt.claim.sub','11111111-1111-1111-1111-111111111111',false);
 insert into people (id, owner_user_id, name) values ('aaaaaaaa-0000-0000-0000-000000000004','11111111-1111-1111-1111-111111111111','Bunty (old)');
@@ -215,3 +215,101 @@ select (select count(*) from groups) as b_groups_removed, (select count(*) from 
 \echo owner names of shared people
 select set_config('request.jwt.claim.sub','22222222-2222-2222-2222-222222222222',false);
 select p->>'name' as name, p->>'owner_name' as owner_name from pull_changes('{}') r, jsonb_array_elements(r->'tables'->'people') p order by 1, 2;
+
+-- ===========================================================================
+\echo ======== security fixes ========
+\echo EXPECT ERROR: users cannot change the profile email copy
+select set_config('request.jwt.claim.sub','33333333-3333-3333-3333-333333333333',false);
+update users set email = 'b@x.com' where id = '33333333-3333-3333-3333-333333333333';
+update users set name = 'Chintu C' where id = '33333333-3333-3333-3333-333333333333';
+select name as c_can_rename from users;
+\echo EXPECT ERROR: Me cannot be turned into someone else
+update people set is_self = false where is_self;
+\echo a request goes to the verified login email only
+reset role; update auth.users set email_confirmed_at = null where id = '33333333-3333-3333-3333-333333333333'; set role authenticated;
+select set_config('request.jwt.claim.sub','22222222-2222-2222-2222-222222222222',false);
+insert into people (id, owner_user_id, name) values ('ffffffff-0000-0000-0000-000000000005','22222222-2222-2222-2222-222222222222','C maybe');
+select request_link('ffffffff-0000-0000-0000-000000000005', 'c@x.com') as req_c \gset
+select set_config('request.jwt.claim.sub','33333333-3333-3333-3333-333333333333',false);
+select count(*) as unverified_c_sees_request from links where id = :'req_c';
+reset role; update auth.users set email_confirmed_at = now() where id = '33333333-3333-3333-3333-333333333333'; set role authenticated;
+select count(*) as verified_c_sees_request, max(invite_code) as invite_code_hidden from links where id = :'req_c';
+select decline_link(:'req_c');
+select set_config('request.jwt.claim.sub','22222222-2222-2222-2222-222222222222',false);
+\echo EXPECT ERROR: asking again right after a decline
+select request_link('ffffffff-0000-0000-0000-000000000005', 'c@x.com');
+
+\echo --- consent: B (connected to A only) cannot drag C in
+-- A puts Chintu (C) and Bunty (B) on one expense, so B can see Chintu
+select set_config('request.jwt.claim.sub','11111111-1111-1111-1111-111111111111',false);
+select upsert_transaction(jsonb_build_object('id','eeeeeeee-0000-0000-0000-000000000010','type','expense','amount',300,'date','2026-10-06',
+  'payers', jsonb_build_array(jsonb_build_object('person_id',:'me_id','amount',300)),
+  'shares', jsonb_build_array(jsonb_build_object('person_id','aaaaaaaa-0000-0000-0000-000000000002','amount',150), jsonb_build_object('person_id','aaaaaaaa-0000-0000-0000-000000000003','amount',150))));
+select set_config('request.jwt.claim.sub','22222222-2222-2222-2222-222222222222',false);
+\echo EXPECT ERROR: B puts Chintu on a new expense
+select upsert_transaction(jsonb_build_object('id','eeeeeeee-0000-0000-0000-000000000011','type','expense','amount',100,'date','2026-10-06',
+  'payers', jsonb_build_array(jsonb_build_object('person_id',:'b_me','amount',100)),
+  'shares', jsonb_build_array(jsonb_build_object('person_id','aaaaaaaa-0000-0000-0000-000000000003','amount',100))));
+\echo EXPECT ERROR: B puts Chintu in a group of B
+select upsert_group(jsonb_build_object('id','cccccccc-0000-0000-0000-0000000000b2','name','B group','member_ids',jsonb_build_array(:'b_me','aaaaaaaa-0000-0000-0000-000000000003')));
+\echo B can still edit the expense Chintu is already on (keeps Chintu)
+select upsert_transaction(jsonb_build_object('id','eeeeeeee-0000-0000-0000-000000000010','type','expense','amount',400,'date','2026-10-06',
+  'payers', jsonb_build_array(jsonb_build_object('person_id','ffffffff-0000-0000-0000-000000000001','amount',400)),
+  'shares', jsonb_build_array(jsonb_build_object('person_id',:'b_me','amount',200), jsonb_build_object('person_id','aaaaaaaa-0000-0000-0000-000000000003','amount',200))));
+select amount as b_edit_saved from transactions where id = 'eeeeeeee-0000-0000-0000-000000000010';
+
+\echo --- history: every change is recorded and visible to those involved
+select set_config('request.jwt.claim.sub','11111111-1111-1111-1111-111111111111',false);
+select action, changed_by = '22222222-2222-2222-2222-222222222222' as by_b, before->>'amount' as before_amt, after->>'amount' as after_amt
+  from transaction_history where transaction_id = 'eeeeeeee-0000-0000-0000-000000000010' order by id;
+\echo EXPECT ERROR: history cannot be written directly
+insert into transaction_history (transaction_id, action) values ('eeeeeeee-0000-0000-0000-000000000010', 'edited');
+
+\echo --- disconnect: A disconnects B
+select set_config('request.jwt.claim.sub','22222222-2222-2222-2222-222222222222',false);
+select count(*) as b_sees_before from transactions;
+select set_config('request.jwt.claim.sub','11111111-1111-1111-1111-111111111111',false);
+select disconnect('aaaaaaaa-0000-0000-0000-000000000002');
+select linked_user_id is null as a_bunty_unlinked from people where id = 'aaaaaaaa-0000-0000-0000-000000000002';
+select count(*) as a_still_has_own_txs from transactions where owner_user_id = '11111111-1111-1111-1111-111111111111';
+select set_config('request.jwt.claim.sub','22222222-2222-2222-2222-222222222222',false);
+select (select count(*) from transactions where owner_user_id = '11111111-1111-1111-1111-111111111111') as b_sees_a_txs_after,
+       (select count(*) from people where owner_user_id = '11111111-1111-1111-1111-111111111111') as b_sees_a_people_after,
+       (select count(*) from transactions where owner_user_id = '22222222-2222-2222-2222-222222222222') as b_keeps_own,
+       (select linked_user_id is null from people where id = 'ffffffff-0000-0000-0000-000000000001') as b_person_for_a_unlinked,
+       (select status from links where id = :'link_id') as link_status;
+\echo EXPECT ERROR: disconnecting twice
+select disconnect('ffffffff-0000-0000-0000-000000000001');
+
+\echo --- invite codes: format, expiry, wrong-code limit
+select set_config('request.jwt.claim.sub','11111111-1111-1111-1111-111111111111',false);
+insert into people (id, owner_user_id, name) values ('aaaaaaaa-0000-0000-0000-000000000009','11111111-1111-1111-1111-111111111111','Later');
+select create_invite('aaaaaaaa-0000-0000-0000-000000000009') as code2 \gset
+select :'code2' ~ '^[A-HJKMNP-Z2-9]{10}$' as code_format_ok;
+reset role; update links set expires_at = now() - interval '1 minute' where invite_code = :'code2'; set role authenticated;
+select set_config('request.jwt.claim.sub','33333333-3333-3333-3333-333333333333',false);
+select accept_link(null, :'code2', null) as expired_code;
+-- one request per attempt, like the app (C already has 2 wrong attempts: the reused and the expired code)
+select accept_link(null, 'WRONGCODE1', null) as wrong_1;
+select accept_link(null, 'WRONGCODE2', null) as wrong_2;
+select accept_link(null, 'WRONGCODE3', null) as wrong_3;
+select accept_link(null, 'WRONGCODE4', null) as wrong_4;
+select accept_link(null, 'WRONGCODE5', null) as wrong_5;
+select accept_link(null, 'WRONGCODE6', null) as wrong_6;
+select accept_link(null, 'WRONGCODE7', null) as wrong_7;
+select accept_link(null, 'WRONGCODE8', null) as wrong_8;
+\echo EXPECT ERROR: the 11th wrong code within the hour is refused
+select accept_link(null, 'WRONG', null);
+
+\echo --- request/invite quota: 20 a day
+select set_config('request.jwt.claim.sub','11111111-1111-1111-1111-111111111111',false);
+do $$ begin
+  for i in 1..25 loop
+    insert into people (owner_user_id, name) values ('11111111-1111-1111-1111-111111111111', 'Q' || i);
+  end loop;
+end $$;
+do $$ declare n int := 0; p record; begin
+  for p in select id from people where name like 'Q%' order by name loop
+    begin perform create_invite(p.id); n := n + 1; exception when others then raise notice 'refused after % more: %', n, sqlerrm; exit; end;
+  end loop;
+end $$;
