@@ -58,7 +58,21 @@ select type, amount, refund_of_id is not null as has_ref, (select count(*) from 
 \echo EXPECT ERROR: refund_of on expense
 update transactions set refund_of_id = 'bbbbbbbb-0000-0000-0000-000000000003' where id='bbbbbbbb-0000-0000-0000-000000000001';
 \echo soft delete
-select upsert_transaction(jsonb_build_object('id','bbbbbbbb-0000-0000-0000-000000000003','type','refund','amount',50000,'date','2026-10-02','deleted_at','2026-10-03T00:00:00Z',
+select upsert_transaction(jsonb_build_object('id','bbbbbbbb-0000-0000-0000-000000000003','type','refund','amount',50000,'date','2026-10-02','deleted_at','2026-10-03T00:00:00Z','refund_of_id','bbbbbbbb-0000-0000-0000-000000000001',
   'payers', jsonb_build_array(jsonb_build_object('person_id',:'me_id','amount',50000)),
   'shares', jsonb_build_array(jsonb_build_object('person_id',:'me_id','amount',50000))));
 select count(*) filter (where deleted_at is not null) deleted from transactions;
+\echo EXPECT ERROR: refund without an original expense
+select upsert_transaction(jsonb_build_object('id','bbbbbbbb-0000-0000-0000-000000000004','type','refund','amount',100,'date','2026-10-02',
+  'payers', jsonb_build_array(jsonb_build_object('person_id',:'me_id','amount',100)),
+  'shares', jsonb_build_array(jsonb_build_object('person_id',:'me_id','amount',100))));
+\echo --- group on transactions
+select upsert_transaction(jsonb_build_object('id','bbbbbbbb-0000-0000-0000-000000000005','type','expense','amount',100,'date','2026-10-02','group_id','cccccccc-0000-0000-0000-000000000001',
+  'payers', jsonb_build_array(jsonb_build_object('person_id',:'me_id','amount',100)),
+  'shares', jsonb_build_array(jsonb_build_object('person_id',:'me_id','amount',100))));
+select count(*) as group_txs from transactions where group_id = 'cccccccc-0000-0000-0000-000000000001';
+\echo EXPECT ERROR: transaction in another user's group
+select set_config('request.jwt.claim.sub','22222222-2222-2222-2222-222222222222',false);
+select upsert_transaction(jsonb_build_object('id','bbbbbbbb-0000-0000-0000-000000000006','type','expense','amount',100,'date','2026-10-02','group_id','cccccccc-0000-0000-0000-000000000001',
+  'payers', jsonb_build_array(jsonb_build_object('person_id',:'b_me','amount',100)),
+  'shares', jsonb_build_array(jsonb_build_object('person_id',:'b_me','amount',100))));

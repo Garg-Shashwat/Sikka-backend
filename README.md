@@ -53,10 +53,10 @@ One `transactions` table for every type, with `transaction_payers` and `transact
 | income     | who received it        | same person (no effect on balances) |
 | settlement | who paid (from)        | who received (to)                   |
 | transfer   | who sent (from)        | who received (to)                   |
-| refund     | who got the money back | whose cost it reduces               |
+| refund     | who got the money back | whose cost it reduces; must reference its expense (`refund_of_id`) |
 
 - A transaction stores a single `subcategory_id`. Each category has one `is_category_default` subcategory (name `NULL`) that means "the category itself", so "Food" and "Food → Restaurant" are both one id and a mismatched category/subcategory pair can't be stored.
-- **Groups** are saved selections of people. The app copies a group's _current_ members into a transaction's shares, so group changes never rewrite history.
+- **Groups** are saved selections of people. The app copies a group's _current_ members into a transaction's shares, so group changes never rewrite history. `transactions.group_id` records which group a transaction was entered under, which drives the group dashboard and group balances.
 - **People** are archived, never deleted (`deleted_at`); there is no delete policy, and foreign keys use `on delete restrict`.
 - `people.linked_user_id` is reserved for linking a Person to a real Sikka account later. It isn't used yet.
 - Every row has an `owner_user_id`. Phase 1 policies only allow the owner; future sharing can widen the policies without reshaping the data.
