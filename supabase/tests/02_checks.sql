@@ -76,3 +76,34 @@ select set_config('request.jwt.claim.sub','22222222-2222-2222-2222-222222222222'
 select upsert_transaction(jsonb_build_object('id','bbbbbbbb-0000-0000-0000-000000000006','type','expense','amount',100,'date','2026-10-02','group_id','cccccccc-0000-0000-0000-000000000001',
   'payers', jsonb_build_array(jsonb_build_object('person_id',:'b_me','amount',100)),
   'shares', jsonb_build_array(jsonb_build_object('person_id',:'b_me','amount',100))));
+\echo --- pull_changes
+select set_config('request.jwt.claim.sub','11111111-1111-1111-1111-111111111111',false);
+select (select count(*) from jsonb_object_keys(r->'tables')) as tables,
+       jsonb_array_length(r->'tables'->'people') as people,
+       jsonb_array_length(r->'tables'->'transactions') as txs,
+       jsonb_array_length(r->'tables'->'users') as users,
+       r->'more' as more
+  from pull_changes('{}') r;
+select jsonb_array_length(t->'transaction_shares') as shares_on_first_tx, t ? 'updated_at' as has_ts
+  from pull_changes('{}') r, jsonb_array_elements(r->'tables'->'transactions') t limit 1;
+select jsonb_array_length(g->'group_members') as group_members from pull_changes('{}') r, jsonb_array_elements(r->'tables'->'groups') g;
+\echo paging by 5 over categories collects every row exactly once
+do $$
+declare cur jsonb := '{}'; r jsonb; seen int := 0; last jsonb; pages int := 0;
+begin
+  loop
+    r := pull_changes(cur, 5);
+    pages := pages + 1;
+    seen := seen + jsonb_array_length(r->'tables'->'categories');
+    last := r->'tables'->'categories'->-1;
+    if last is not null then cur := cur || jsonb_build_object('categories', jsonb_build_object('ts', last->>'updated_at', 'id', last->>'id')); end if;
+    exit when jsonb_array_length(r->'tables'->'categories') < 5 or pages > 20;
+  end loop;
+  raise notice 'categories seen % of %, pages %', seen, (select count(*) from categories), pages;
+end $$;
+\echo nothing new after the latest cursor
+select jsonb_array_length(r->'tables'->'people') as people_after
+  from pull_changes(jsonb_build_object('people', jsonb_build_object('ts', (select max(updated_at) from people)::text, 'id', 'ffffffff-ffff-ffff-ffff-ffffffffffff'))) r;
+\echo user B sees none of A
+select set_config('request.jwt.claim.sub','22222222-2222-2222-2222-222222222222',false);
+select jsonb_array_length(r->'tables'->'transactions') as b_txs, jsonb_array_length(r->'tables'->'people') as b_people from pull_changes('{}') r;

@@ -64,7 +64,7 @@ One `transactions` table for every type, with `transaction_payers` and `transact
 ## Sync contract
 
 - IDs are UUIDs generated on the client, so retried writes are idempotent.
-- `updated_at` is always set by the server (trigger) and is the client's pull cursor.
+- `updated_at` is always set by the server (trigger) and is the client's pull cursor. `pull_changes(p_since, p_limit)` returns changes for all tables in one call, using keyset paging on `(updated_at, id)`.
 - Deletions are `deleted_at` tombstones so they reach other devices.
 - `upsert_transaction(p jsonb)` and `upsert_group(p jsonb)` write a whole aggregate atomically: the row plus its payers, shares and tags, or its members. They run as `SECURITY INVOKER`, so RLS still applies.
 - New accounts get a `users` profile, a "Me" person and starter categories from the `on_auth_user_created` trigger.
