@@ -524,3 +524,13 @@ select (select p->>'name' from jsonb_array_elements(r->'tables'->'people') p whe
        (select u->>'name' from jsonb_array_elements(r->'tables'->'users') u) as profile
 from pull_changes('{}') r;
 reset role;
+
+-- ===========================================================================
+\echo ======== email_status (email-first sign-in) ========
+reset role;
+insert into auth.users (id, email, email_confirmed_at) values ('99999999-9999-9999-9999-999999999999', 'pending@x.com', null);
+set role anon;
+\echo account, account (case and spaces ignored), new, new (unconfirmed sign-up), new (empty)
+select email_status('a@x.com') as a, email_status('  A@X.com ') as a_mixed, email_status('nobody@x.com') as nobody,
+       email_status('pending@x.com') as unconfirmed, email_status(null) as empty;
+reset role;
