@@ -48,7 +48,7 @@ npx supabase db reset   # re-apply migrations from scratch
 supabase/tests/run.sh
 ```
 
-This applies the migrations to a throwaway Postgres container, using a minimal stub of Supabase's `auth` and `storage` schemas, and runs integrity and RLS checks. Every line marked `EXPECT ERROR` should be followed by an error.
+This applies the migrations to a throwaway Postgres container, using a minimal stub of Supabase's `auth` and `storage` schemas, and runs integrity and RLS checks, including a replay of every push the app makes followed by a pull. Every line marked `EXPECT ERROR` should be followed by an error.
 
 ## Data model
 
@@ -76,6 +76,8 @@ Kept on the server ([migration](supabase/migrations/20261013000000_access_lists.
 - **Whitelist off**: everyone can, except emails on the block list.
 - One list: each email (`asha@gmail.com`) or domain (`@family.in`) has a single entry, marked `allow` or `block`. If an email and its domain disagree, the block wins.
 - Everyone who already had an account when this was introduced was added to the allow list.
+
+**Email-first sign-in.** `email_status(email)` can be called before signing in and answers only `account` or `new` (unconfirmed sign-ups count as new), so the app's start screen can ask for a password or open sign-up. It never reveals which list an email is on. It does reveal whether an email uses Sikka, as Supabase's sign-up already does ([migration](supabase/migrations/20261016000000_email_status.sql)).
 
 Enforced by two Supabase Auth hooks: *Before User Created* refuses sign-ups, and *Custom Access Token* refuses every sign-in and token refresh, so a newly blocked person is signed out everywhere within the access-token lifetime (1 hour by default). Refusals all show the same message, so nobody can tell which list they're on.
 
@@ -128,6 +130,7 @@ A shared ledger, like Splitwise ([migration](supabase/migrations/20261009000000_
 - IDs are UUIDs generated on the client, so retried writes are idempotent.
 - `updated_at` is always set by the server (trigger) and is the client's pull cursor. `pull_changes(p_since, p_limit)` returns changes for all tables in one call, using keyset paging on `(updated_at, id)`.
 - Deletions are `deleted_at` tombstones so they reach other devices.
+- The app writes `people`, `categories`, `subcategories`, `tags` and `attachments` with plain upserts (`INSERT … ON CONFLICT DO UPDATE`). Postgres checks an upsert's new row against the table's **SELECT** policy too, so those policies must accept a row that isn't in the table yet: they check `owner_user_id = auth.uid()` directly, besides the `visible_*_ids()` lookups for shared rows ([20261015000000_upsert_own_rows.sql](supabase/migrations/20261015000000_upsert_own_rows.sql)). A SELECT policy based only on a lookup refuses every new row.
 - `upsert_transaction(p jsonb)` and `upsert_group(p jsonb)` write a whole aggregate atomically: the row plus its payers, shares and the caller's tags, or its members. They are `SECURITY DEFINER` with explicit permission checks (there are no direct-write policies on these tables).
 - New accounts get a `users` profile, a "Me" person and starter categories from the `on_auth_user_created` trigger (`handle_new_user`; the current list is in [20261014000100_default_categories_v2.sql](supabase/migrations/20261014000100_default_categories_v2.sql)). Changing the list only affects accounts created afterwards.
 - Tables are in the `supabase_realtime` publication so other devices get notified to pull. Realtime applies RLS, so apps subscribe without an owner filter and also hear about shared rows and connection requests.
