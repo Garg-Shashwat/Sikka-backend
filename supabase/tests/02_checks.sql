@@ -414,3 +414,113 @@ from categories c join subcategories s on s.category_id = c.id
 where c.owner_user_id = '88888888-8888-8888-8888-888888888888'
 group by c.name, c.icon, c.sort_order order by c.sort_order;
 select count(*) as fresh_me from people where owner_user_id = '88888888-8888-8888-8888-888888888888' and is_self and linked_user_id = owner_user_id;
+
+-- ===========================================================================
+\echo ======== app pushes: upserts of brand-new rows ========
+set role authenticated;
+select set_config('request.jwt.claim.sub','88888888-8888-8888-8888-888888888888',false);
+insert into people (id, owner_user_id, name) values ('88888888-0000-0000-0000-000000000001','88888888-8888-8888-8888-888888888888','New friend')
+  on conflict (id) do update set name = excluded.name;
+insert into categories (id, owner_user_id, name, icon, color) values ('88888888-0000-0000-0000-000000000002','88888888-8888-8888-8888-888888888888','New category','tag','#888888')
+  on conflict (id) do update set name = excluded.name;
+insert into subcategories (id, owner_user_id, category_id, name, is_category_default) values ('88888888-0000-0000-0000-000000000003','88888888-8888-8888-8888-888888888888','88888888-0000-0000-0000-000000000002',null,true)
+  on conflict (id) do update set name = excluded.name;
+insert into tags (id, owner_user_id, name, color) values ('88888888-0000-0000-0000-000000000004','88888888-8888-8888-8888-888888888888','New tag','#888888')
+  on conflict (id) do update set name = excluded.name;
+select (select count(*) from people where id = '88888888-0000-0000-0000-000000000001') as new_person,
+       (select count(*) from categories where id = '88888888-0000-0000-0000-000000000002') as new_category,
+       (select count(*) from subcategories where id = '88888888-0000-0000-0000-000000000003') as new_subcategory,
+       (select count(*) from tags where id = '88888888-0000-0000-0000-000000000004') as new_tag;
+\echo still private: another account sees none of them (0)
+select set_config('request.jwt.claim.sub','11111111-1111-1111-1111-111111111111',false);
+select count(*) as others_see from people where owner_user_id = '88888888-8888-8888-8888-888888888888' and not is_self;
+reset role;
+\echo EXPECT ERROR: another account cannot take over my new person through an upsert
+select set_config('request.jwt.claim.sub','11111111-1111-1111-1111-111111111111',false);
+set role authenticated;
+insert into people (id, owner_user_id, name) values ('88888888-0000-0000-0000-000000000001','11111111-1111-1111-1111-111111111111','Hijacked')
+  on conflict (id) do update set name = excluded.name, owner_user_id = excluded.owner_user_id;
+\echo EXPECT ERROR: another account cannot take over my new category through an upsert
+insert into categories (id, owner_user_id, name, icon, color) values ('88888888-0000-0000-0000-000000000002','11111111-1111-1111-1111-111111111111','Hijacked','tag','#000000')
+  on conflict (id) do update set name = excluded.name, owner_user_id = excluded.owner_user_id;
+\echo EXPECT ERROR: cannot create a person owned by another account
+insert into people (id, owner_user_id, name) values ('88888888-0000-0000-0000-000000000009','88888888-8888-8888-8888-888888888888','Planted')
+  on conflict (id) do update set name = excluded.name;
+\echo EXPECT ERROR: cannot create a subcategory owned by another account
+insert into subcategories (id, owner_user_id, category_id, name, is_category_default) values ('88888888-0000-0000-0000-000000000008','88888888-8888-8888-8888-888888888888','88888888-0000-0000-0000-000000000002','Planted',false)
+  on conflict (id) do update set name = excluded.name;
+\echo unchanged and still invisible to the other account (0 0 0)
+select (select count(*) from people where owner_user_id = '88888888-8888-8888-8888-888888888888') as people_seen,
+       (select count(*) from categories where owner_user_id = '88888888-8888-8888-8888-888888888888') as categories_seen,
+       (select count(*) from subcategories where owner_user_id = '88888888-8888-8888-8888-888888888888') as subcategories_seen;
+reset role;
+select name, owner_user_id = '88888888-8888-8888-8888-888888888888' as still_owner from people where id = '88888888-0000-0000-0000-000000000001'
+union all select name, owner_user_id = '88888888-8888-8888-8888-888888888888' from categories where id = '88888888-0000-0000-0000-000000000002';
+select count(*) as planted_rows from (select id from people where id = '88888888-0000-0000-0000-000000000009' union all select id from subcategories where id = '88888888-0000-0000-0000-000000000008') x;
+
+-- ===========================================================================
+\echo ======== app sync, every push the app makes (as in mobile/src/sync/engine.ts) ========
+set role authenticated;
+select set_config('request.jwt.claim.sub','88888888-8888-8888-8888-888888888888',false);
+\echo profile
+update users set name = 'Fresh', default_currency = 'INR' where id = '88888888-8888-8888-8888-888888888888';
+\echo person: create, edit, archive, unarchive
+insert into people (id, owner_user_id, name, phone, avatar_url, is_self, created_at, deleted_at) values
+  ('88888888-0000-0000-0000-0000000000a1','88888888-8888-8888-8888-888888888888','Asha',null,null,false,now(),null)
+  on conflict (id) do update set name = excluded.name, phone = excluded.phone, avatar_url = excluded.avatar_url, is_self = excluded.is_self, created_at = excluded.created_at, deleted_at = excluded.deleted_at;
+insert into people (id, owner_user_id, name, phone, avatar_url, is_self, created_at, deleted_at) values
+  ('88888888-0000-0000-0000-0000000000a1','88888888-8888-8888-8888-888888888888','Asha K','98',null,false,now(),now())
+  on conflict (id) do update set name = excluded.name, phone = excluded.phone, avatar_url = excluded.avatar_url, is_self = excluded.is_self, created_at = excluded.created_at, deleted_at = excluded.deleted_at;
+insert into people (id, owner_user_id, name, phone, avatar_url, is_self, created_at, deleted_at) values
+  ('88888888-0000-0000-0000-0000000000a1','88888888-8888-8888-8888-888888888888','Asha K','98',null,false,now(),null)
+  on conflict (id) do update set name = excluded.name, phone = excluded.phone, avatar_url = excluded.avatar_url, is_self = excluded.is_self, created_at = excluded.created_at, deleted_at = excluded.deleted_at;
+\echo category + its default subcategory + a subcategory: create, edit, archive
+insert into categories (id, owner_user_id, name, icon, color, sort_order, created_at, deleted_at) values
+  ('88888888-0000-0000-0000-0000000000b1','88888888-8888-8888-8888-888888888888','Pets','paw','#123456',99,now(),null)
+  on conflict (id) do update set name = excluded.name, icon = excluded.icon, color = excluded.color, sort_order = excluded.sort_order, created_at = excluded.created_at, deleted_at = excluded.deleted_at;
+insert into subcategories (id, owner_user_id, category_id, name, is_category_default, created_at, deleted_at) values
+  ('88888888-0000-0000-0000-0000000000b2','88888888-8888-8888-8888-888888888888','88888888-0000-0000-0000-0000000000b1',null,true,now(),null)
+  on conflict (id) do update set category_id = excluded.category_id, name = excluded.name, is_category_default = excluded.is_category_default, created_at = excluded.created_at, deleted_at = excluded.deleted_at;
+insert into subcategories (id, owner_user_id, category_id, name, is_category_default, created_at, deleted_at) values
+  ('88888888-0000-0000-0000-0000000000b3','88888888-8888-8888-8888-888888888888','88888888-0000-0000-0000-0000000000b1','Vet',false,now(),null)
+  on conflict (id) do update set category_id = excluded.category_id, name = excluded.name, is_category_default = excluded.is_category_default, created_at = excluded.created_at, deleted_at = excluded.deleted_at;
+insert into categories (id, owner_user_id, name, icon, color, sort_order, created_at, deleted_at) values
+  ('88888888-0000-0000-0000-0000000000b1','88888888-8888-8888-8888-888888888888','Pet care','paw','#654321',99,now(),null)
+  on conflict (id) do update set name = excluded.name, icon = excluded.icon, color = excluded.color, sort_order = excluded.sort_order, created_at = excluded.created_at, deleted_at = excluded.deleted_at;
+insert into subcategories (id, owner_user_id, category_id, name, is_category_default, created_at, deleted_at) values
+  ('88888888-0000-0000-0000-0000000000b4','88888888-8888-8888-8888-888888888888','88888888-0000-0000-0000-0000000000b1','Grooming',false,now(),now())
+  on conflict (id) do update set category_id = excluded.category_id, name = excluded.name, is_category_default = excluded.is_category_default, created_at = excluded.created_at, deleted_at = excluded.deleted_at;
+\echo tag: create, edit, archive
+insert into tags (id, owner_user_id, name, color, emoji, created_at, deleted_at) values
+  ('88888888-0000-0000-0000-0000000000c1','88888888-8888-8888-8888-888888888888','Trip','#111111',null,now(),null)
+  on conflict (id) do update set name = excluded.name, color = excluded.color, emoji = excluded.emoji, created_at = excluded.created_at, deleted_at = excluded.deleted_at;
+insert into tags (id, owner_user_id, name, color, emoji, created_at, deleted_at) values
+  ('88888888-0000-0000-0000-0000000000c1','88888888-8888-8888-8888-888888888888','Goa trip','#222222','🏖',now(),now())
+  on conflict (id) do update set name = excluded.name, color = excluded.color, emoji = excluded.emoji, created_at = excluded.created_at, deleted_at = excluded.deleted_at;
+select id as fresh_me from people where owner_user_id = '88888888-8888-8888-8888-888888888888' and is_self \gset
+\echo group with the new person
+select upsert_group(jsonb_build_object('id','88888888-0000-0000-0000-0000000000d1','name','Pet parents','member_ids',jsonb_build_array(:'fresh_me','88888888-0000-0000-0000-0000000000a1')));
+\echo expense using the new person, subcategory and tag, in the group
+select upsert_transaction(jsonb_build_object('id','88888888-0000-0000-0000-0000000000e1','type','expense','amount',2000,'currency','INR','date','2026-10-13','description','Vet visit',
+  'subcategory_id','88888888-0000-0000-0000-0000000000b3','group_id','88888888-0000-0000-0000-0000000000d1','tag_ids',jsonb_build_array('88888888-0000-0000-0000-0000000000c1'),
+  'payers', jsonb_build_array(jsonb_build_object('person_id',:'fresh_me','amount',2000)),
+  'shares', jsonb_build_array(jsonb_build_object('person_id',:'fresh_me','amount',1000), jsonb_build_object('person_id','88888888-0000-0000-0000-0000000000a1','amount',1000))));
+\echo receipt on it: create, then delete
+insert into attachments (id, owner_user_id, transaction_id, storage_path, mime_type, size_bytes, created_at, deleted_at) values
+  ('88888888-0000-0000-0000-0000000000f1','88888888-8888-8888-8888-888888888888','88888888-0000-0000-0000-0000000000e1','88888888-8888-8888-8888-888888888888/r1.jpg','image/jpeg',100,now(),null)
+  on conflict (id) do update set transaction_id = excluded.transaction_id, storage_path = excluded.storage_path, mime_type = excluded.mime_type, size_bytes = excluded.size_bytes, created_at = excluded.created_at, deleted_at = excluded.deleted_at;
+insert into attachments (id, owner_user_id, transaction_id, storage_path, mime_type, size_bytes, created_at, deleted_at) values
+  ('88888888-0000-0000-0000-0000000000f1','88888888-8888-8888-8888-888888888888','88888888-0000-0000-0000-0000000000e1','88888888-8888-8888-8888-888888888888/r1.jpg','image/jpeg',100,now(),now())
+  on conflict (id) do update set transaction_id = excluded.transaction_id, storage_path = excluded.storage_path, mime_type = excluded.mime_type, size_bytes = excluded.size_bytes, created_at = excluded.created_at, deleted_at = excluded.deleted_at;
+\echo all of it comes back on pull (Asha K live, Pet care, Vet + Grooming archived, Goa trip archived, group of 2, expense with 1 tag, deleted receipt)
+select (select p->>'name' from jsonb_array_elements(r->'tables'->'people') p where p->>'id' = '88888888-0000-0000-0000-0000000000a1' and p->>'deleted_at' is null) as person,
+       (select c->>'name' from jsonb_array_elements(r->'tables'->'categories') c where c->>'id' = '88888888-0000-0000-0000-0000000000b1') as category,
+       (select count(*) from jsonb_array_elements(r->'tables'->'subcategories') s where s->>'category_id' = '88888888-0000-0000-0000-0000000000b1') as subcategories,
+       (select (s->>'deleted_at') is not null from jsonb_array_elements(r->'tables'->'subcategories') s where s->>'id' = '88888888-0000-0000-0000-0000000000b4') as grooming_archived,
+       (select t->>'name' || case when t->>'deleted_at' is not null then ' (archived)' else '' end from jsonb_array_elements(r->'tables'->'tags') t where t->>'id' = '88888888-0000-0000-0000-0000000000c1') as tag,
+       (select jsonb_array_length(g->'group_members') from jsonb_array_elements(r->'tables'->'groups') g where g->>'id' = '88888888-0000-0000-0000-0000000000d1') as group_members,
+       (select jsonb_array_length(t->'transaction_tags') from jsonb_array_elements(r->'tables'->'transactions') t where t->>'id' = '88888888-0000-0000-0000-0000000000e1') as tx_tags,
+       (select (a->>'deleted_at') is not null from jsonb_array_elements(r->'tables'->'attachments') a where a->>'id' = '88888888-0000-0000-0000-0000000000f1') as receipt_deleted,
+       (select u->>'name' from jsonb_array_elements(r->'tables'->'users') u) as profile
+from pull_changes('{}') r;
+reset role;
