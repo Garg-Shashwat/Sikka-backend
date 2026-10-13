@@ -359,3 +359,47 @@ set role anon;
 \echo EXPECT ERROR: anon calls a hook
 select public.hook_before_user_created('{"user": {"email": "x@x.com"}}');
 reset role;
+
+-- ===========================================================================
+\echo ======== account deletion ========
+-- K (3333) is connected to A (A's "Chintu"); K adds a shared expense with A and a private one.
+set role authenticated;
+select set_config('request.jwt.claim.sub','33333333-3333-3333-3333-333333333333',false);
+select id as k_me from people where is_self \gset
+select id as k_for_a from people where owner_user_id = '33333333-3333-3333-3333-333333333333' and linked_user_id = '11111111-1111-1111-1111-111111111111' \gset
+select id as k_sub from subcategories where owner_user_id = '33333333-3333-3333-3333-333333333333' and name = 'Fuel' \gset
+select upsert_transaction(jsonb_build_object('id','99999999-0000-0000-0000-000000000001','type','expense','amount',800,'date','2026-10-10','description','K and A taxi','subcategory_id',:'k_sub',
+  'payers', jsonb_build_array(jsonb_build_object('person_id',:'k_me','amount',800)),
+  'shares', jsonb_build_array(jsonb_build_object('person_id',:'k_me','amount',400), jsonb_build_object('person_id',:'k_for_a','amount',400))));
+select upsert_transaction(jsonb_build_object('id','99999999-0000-0000-0000-000000000002','type','expense','amount',100,'date','2026-10-10','description','K private',
+  'payers', jsonb_build_array(jsonb_build_object('person_id',:'k_me','amount',100)),
+  'shares', jsonb_build_array(jsonb_build_object('person_id',:'k_me','amount',100))));
+-- A records an expense with Chintu (K) using one of A's own categories
+select set_config('request.jwt.claim.sub','11111111-1111-1111-1111-111111111111',false);
+select upsert_transaction(jsonb_build_object('id','99999999-0000-0000-0000-000000000003','type','expense','amount',600,'date','2026-10-11','description','A and Chintu lunch','subcategory_id',:'sub_id',
+  'payers', jsonb_build_array(jsonb_build_object('person_id',:'me_id','amount',600)),
+  'shares', jsonb_build_array(jsonb_build_object('person_id',:'me_id','amount',300), jsonb_build_object('person_id','aaaaaaaa-0000-0000-0000-000000000003','amount',300))));
+-- A edits K's taxi (A is on it), putting it under A's category
+select upsert_transaction(jsonb_build_object('id','99999999-0000-0000-0000-000000000001','type','expense','amount',800,'date','2026-10-10','description','K and A taxi','subcategory_id',:'sub_id',
+  'payers', jsonb_build_array(jsonb_build_object('person_id','aaaaaaaa-0000-0000-0000-000000000003','amount',800)),
+  'shares', jsonb_build_array(jsonb_build_object('person_id','aaaaaaaa-0000-0000-0000-000000000003','amount',400), jsonb_build_object('person_id',:'me_id','amount',400))));
+\echo K deletes the account
+select set_config('request.jwt.claim.sub','33333333-3333-3333-3333-333333333333',false);
+select delete_my_account();
+reset role;
+select (select count(*) from auth.users where id = '33333333-3333-3333-3333-333333333333') as k_auth_rows,
+       (select count(*) from users where id = '33333333-3333-3333-3333-333333333333') as k_profile,
+       (select count(*) from people where owner_user_id = '33333333-3333-3333-3333-333333333333') as k_people,
+       (select count(*) from transactions where owner_user_id = '33333333-3333-3333-3333-333333333333') as k_txs,
+       (select count(*) from categories where owner_user_id = '33333333-3333-3333-3333-333333333333') as k_categories,
+       (select count(*) from links where from_user = '33333333-3333-3333-3333-333333333333' or to_user = '33333333-3333-3333-3333-333333333333') as k_links;
+\echo A keeps the lunch, with Chintu as a plain name
+select t.description, p.name, p.linked_user_id is null as plain
+from transactions t join transaction_shares s on s.transaction_id = t.id join people p on p.id = s.person_id
+where t.id = '99999999-0000-0000-0000-000000000003' order by p.name;
+\echo the account email can sign up again later (nothing left behind)
+select count(*) as leftovers from people where linked_user_id = '33333333-3333-3333-3333-333333333333';
+\echo EXPECT ERROR: anon cannot delete accounts
+set role anon;
+select delete_my_account();
+reset role;

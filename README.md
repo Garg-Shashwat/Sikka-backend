@@ -89,6 +89,10 @@ select * from private.access_list order by list, entry;
 select whitelist_enabled from private.access_settings;
 ```
 
+## Account deletion
+
+`delete_my_account()` permanently deletes the caller's account and everything it owns (the app first removes the receipt files through the Storage API). Connections are disconnected first, and where other accounts' records mention one of the deleted person's people, those accounts get their own plain copy of that person, so their records stay intact. Google Play also requires a public deletion page: [docs/delete-account.html](docs/delete-account.html).
+
 ## Sharing between accounts
 
 A shared ledger, like Splitwise ([migration](supabase/migrations/20261009000000_sharing.sql)):
