@@ -403,3 +403,14 @@ select count(*) as leftovers from people where linked_user_id = '33333333-3333-3
 set role anon;
 select delete_my_account();
 reset role;
+
+-- ===========================================================================
+\echo ======== starter categories (new accounts) ========
+reset role;
+insert into auth.users (id, email) values ('88888888-8888-8888-8888-888888888888', 'fresh@x.com');
+select c.name as category, c.icon, string_agg(s.name, ', ' order by s.created_at, s.name) filter (where not s.is_category_default) as subcategories,
+       count(*) filter (where s.is_category_default) as default_rows
+from categories c join subcategories s on s.category_id = c.id
+where c.owner_user_id = '88888888-8888-8888-8888-888888888888'
+group by c.name, c.icon, c.sort_order order by c.sort_order;
+select count(*) as fresh_me from people where owner_user_id = '88888888-8888-8888-8888-888888888888' and is_self and linked_user_id = owner_user_id;

@@ -129,5 +129,5 @@ A shared ledger, like Splitwise ([migration](supabase/migrations/20261009000000_
 - `updated_at` is always set by the server (trigger) and is the client's pull cursor. `pull_changes(p_since, p_limit)` returns changes for all tables in one call, using keyset paging on `(updated_at, id)`.
 - Deletions are `deleted_at` tombstones so they reach other devices.
 - `upsert_transaction(p jsonb)` and `upsert_group(p jsonb)` write a whole aggregate atomically: the row plus its payers, shares and the caller's tags, or its members. They are `SECURITY DEFINER` with explicit permission checks (there are no direct-write policies on these tables).
-- New accounts get a `users` profile, a "Me" person and starter categories from the `on_auth_user_created` trigger.
+- New accounts get a `users` profile, a "Me" person and starter categories from the `on_auth_user_created` trigger (`handle_new_user`; the current list is in [20261014000100_default_categories_v2.sql](supabase/migrations/20261014000100_default_categories_v2.sql)). Changing the list only affects accounts created afterwards.
 - Tables are in the `supabase_realtime` publication so other devices get notified to pull. Realtime applies RLS, so apps subscribe without an owner filter and also hear about shared rows and connection requests.
