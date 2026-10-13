@@ -1,15 +1,18 @@
 # Sikka — backend
 
-Supabase project for Sikka: Postgres schema, Row Level Security, sync RPCs, new-account bootstrap and the receipts storage bucket. The mobile app lives in the separate **mobile** repo (`../mobile`).
+Supabase project for Sikka: Postgres schema, Row Level Security, sync RPCs, sharing between accounts, sign-up whitelist/blacklist, account deletion, new-account bootstrap and the receipts storage bucket. The mobile app lives in the separate **mobile** repo (`../mobile`).
 
 ```
-supabase/config.toml     Supabase CLI config (local dev, auth settings)
+supabase/config.toml     Supabase CLI config (local dev, auth settings, auth hooks)
 supabase/migrations/     schema, RLS, RPCs, triggers, storage policies
 supabase/templates/      auth emails (6-digit codes for sign-up and password reset)
 supabase/tests/          integrity + RLS checks run against a throwaway Postgres
+docs/                    public web pages (privacy policy, account deletion) for GitHub Pages
 ```
 
 ## Deploy to a Supabase project
+
+The hosted project is connected to this repo through Supabase's GitHub integration: **pushing to `main` applies new migrations** automatically (usually within a minute). To deploy by hand instead:
 
 ```bash
 npx supabase login
@@ -17,13 +20,17 @@ npx supabase link --project-ref <your-project-ref>
 npx supabase db push
 ```
 
+Never run `supabase config push`: auth settings (SMTP, templates, hooks) are managed in the dashboard and it would overwrite them. Migrations that have been applied are never edited; changes go in a new migration.
+
 Then set up the auth emails in the dashboard. The app confirms sign-ups and resets passwords with a **6-digit code** typed into the app, not a link: links can't return to an app running in Expo Go, because the auth server always rejects `exp://<LAN IP>` addresses.
 
 1. **Authentication → Emails → Templates → Confirm signup**: set the subject to `Your Sikka confirmation code`, and set the body to the contents of [supabase/templates/confirmation.html](supabase/templates/confirmation.html).
 2. **Reset Password** template: set the subject to `Your Sikka password reset code`, and set the body to [supabase/templates/recovery.html](supabase/templates/recovery.html).
-3. **Authentication → Sign In / Providers → Email**: keep **Confirm email** on and **Email OTP Length** at 6.
+3. **Authentication → Sign In / Providers → Email**: keep **Confirm email** on, **Email OTP Length** at 6, and set **Minimum password length** to 8 (the app asks for 8).
+4. **Authentication → Rate Limits**: keep the email and verification limits low (family scale: tens per hour).
+5. **Authentication → Hooks**: enable the two access-list hooks (see *Who can use Sikka* below).
 
-The built-in email sender allows only a few emails per hour. For real users, set up custom SMTP under **Authentication → Emails → SMTP Settings**.
+The built-in email sender allows only a few emails per hour. For real users, set up custom SMTP under **Authentication → Emails → SMTP Settings** (currently Gmail, fine for family use).
 
 Give the mobile app the project URL and publishable key (Project Settings → API Keys).
 
@@ -57,8 +64,9 @@ One `transactions` table for every type, with `transaction_payers` and `transact
 
 - A transaction stores a single `subcategory_id`. Each category has one `is_category_default` subcategory (name `NULL`) that means "the category itself", so "Food" and "Food → Restaurant" are both one id and a mismatched category/subcategory pair can't be stored.
 - **Groups** are saved selections of people. The app copies a group's _current_ members into a transaction's shares, so group changes never rewrite history. `transactions.group_id` records which group a transaction was entered under, which drives the group dashboard and group balances.
-- **People** are archived, never deleted (`deleted_at`); there is no delete policy, and foreign keys use `on delete restrict`.
-- Every row has an `owner_user_id`: the account that created it. Categories, subcategories and tags are always private; new accounts get their own copy of the starter categories.
+- **People** are archived, not deleted (`deleted_at`); there is no delete policy, and foreign keys use `on delete restrict`. The only hard delete is account deletion (below).
+- Every row has an `owner_user_id`: the account that created it. Each account has its own categories, subcategories and tags (new accounts get their own copy of the starter categories). Tags are never shown to anyone else; a category's name and icon are readable by others only on shared transactions that use it.
+- **Receipts** are files in the private `receipts` bucket under `<user id>/…`. Each account uploads only into its own folder; a receipt can be read by everyone who can see its transaction.
 
 ## Who can use Sikka (whitelist / blacklist)
 
@@ -88,6 +96,10 @@ select private.set_whitelist(false);               -- open to everyone except th
 select * from private.access_list order by list, entry;
 select whitelist_enabled from private.access_settings;
 ```
+
+## Public pages
+
+[docs/](docs/) holds the privacy policy ([privacy.html](docs/privacy.html)) and the account-deletion page ([delete-account.html](docs/delete-account.html)) required by Google Play. Serve them with GitHub Pages (repo Settings → Pages → `main` / `/docs`); the app links to `https://garg-shashwat.github.io/Sikka-backend/privacy.html`. Replace `SUPPORT_EMAIL` in the pages before release.
 
 ## Account deletion
 
