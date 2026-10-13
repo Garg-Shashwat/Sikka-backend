@@ -60,6 +60,35 @@ One `transactions` table for every type, with `transaction_payers` and `transact
 - **People** are archived, never deleted (`deleted_at`); there is no delete policy, and foreign keys use `on delete restrict`.
 - Every row has an `owner_user_id`: the account that created it. Categories, subcategories and tags are always private; new accounts get their own copy of the starter categories.
 
+## Who can use Sikka (whitelist / blacklist)
+
+Kept on the server ([migration](supabase/migrations/20261013000000_access_lists.sql)), in the `private` schema that the API can't reach:
+
+- **Whitelist on** (the default): only emails on the allow list can sign up or sign in.
+- **Whitelist off**: everyone can, except emails on the block list.
+- One list: each email (`asha@gmail.com`) or domain (`@family.in`) has a single entry, marked `allow` or `block`. If an email and its domain disagree, the block wins.
+- Everyone who already had an account when this was introduced was added to the allow list.
+
+Enforced by two Supabase Auth hooks: *Before User Created* refuses sign-ups, and *Custom Access Token* refuses every sign-in and token refresh, so a newly blocked person is signed out everywhere within the access-token lifetime (1 hour by default). Refusals all show the same message, so nobody can tell which list they're on.
+
+**One-time setup on the hosted project** (dashboard → Authentication → Hooks):
+
+1. *Before User Created* → Postgres → schema `public`, function `hook_before_user_created`.
+2. *Customize Access Token (JWT) Claims* → Postgres → schema `public`, function `hook_custom_access_token`.
+
+Until both are enabled, the lists have no effect.
+
+**Managing the lists** (dashboard → SQL editor):
+
+```sql
+select private.allow('asha@gmail.com');            -- or a domain: private.allow('@family.in')
+select private.block('spammer@example.com');        -- also switches an allowed entry to blocked
+select private.unlist('asha@gmail.com');           -- remove the entry
+select private.set_whitelist(false);               -- open to everyone except the block list
+select * from private.access_list order by list, entry;
+select whitelist_enabled from private.access_settings;
+```
+
 ## Sharing between accounts
 
 A shared ledger, like Splitwise ([migration](supabase/migrations/20261009000000_sharing.sql)):

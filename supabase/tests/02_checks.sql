@@ -313,3 +313,49 @@ do $$ declare n int := 0; p record; begin
     begin perform create_invite(p.id); n := n + 1; exception when others then raise notice 'refused after % more: %', n, sqlerrm; exit; end;
   end loop;
 end $$;
+
+-- ===========================================================================
+\echo ======== access lists (whitelist / blacklist) ========
+reset role;
+-- (Existing accounts are copied to the allow list when the migration runs; here users are
+-- created after migrating, so the lists start empty.)
+select private.allow('a@x.com'); select private.allow('@family.in'); select private.block('bad@family.in');
+-- one entry per email: blocking an allowed email switches it
+select private.allow('both@x.com'); select private.block('both@x.com');
+select count(*) as entries_for_both, max(list) as now_listed from private.access_list where entry = 'both@x.com';
+-- an allowed email inside a blocked domain stays blocked
+select private.block('@spam.io'); select private.allow('friend@spam.io');
+\echo whitelist ON (default)
+select e, public.hook_before_user_created(jsonb_build_object('user', jsonb_build_object('email', e))) = '{}'::jsonb as can_sign_up,
+       public.hook_custom_access_token(jsonb_build_object('user_id', gen_random_uuid(), 'claims', jsonb_build_object('email', e, 'sub', 'x'))) ? 'claims' as can_sign_in
+from unnest(array['a@x.com', 'A@X.com ', 'mom@family.in', 'bad@family.in', 'both@x.com', 'friend@spam.io', 'stranger@x.com', '']) as e;
+\echo whitelist OFF
+select private.set_whitelist(false);
+select e, public.hook_before_user_created(jsonb_build_object('user', jsonb_build_object('email', e))) = '{}'::jsonb as can_sign_up
+from unnest(array['stranger@x.com', 'bad@family.in', 'both@x.com', 'a@x.com']) as e;
+select private.set_whitelist(true);
+\echo the refusal message and that claims pass through unchanged
+select public.hook_before_user_created('{"user": {"email": "stranger@x.com"}}') as refusal;
+select public.hook_custom_access_token('{"user_id": "11111111-1111-1111-1111-111111111111", "claims": {"email": "a@x.com", "role": "authenticated"}}') as allowed_claims;
+\echo email looked up from the account when the token has none
+select public.hook_custom_access_token('{"user_id": "11111111-1111-1111-1111-111111111111", "claims": {"role": "authenticated"}}') ? 'claims' as a_by_user_id;
+\echo switching back to allow, then removing the entry
+select private.allow('both@x.com');
+select public.hook_before_user_created('{"user": {"email": "both@x.com"}}') = '{}'::jsonb as both_allowed_again;
+select private.unlist('both@x.com');
+select public.hook_before_user_created('{"user": {"email": "both@x.com"}}') = '{}'::jsonb as both_after_unlist;
+\echo EXPECT ERROR: an invalid entry
+select private.allow('not-an-email');
+\echo API roles cannot read the lists or call the hooks
+set role authenticated;
+select set_config('request.jwt.claim.sub','11111111-1111-1111-1111-111111111111',false);
+\echo EXPECT ERROR: authenticated reads the list
+select * from private.access_list;
+\echo EXPECT ERROR: authenticated calls a hook
+select public.hook_custom_access_token('{"user_id": "11111111-1111-1111-1111-111111111111", "claims": {}}');
+\echo EXPECT ERROR: authenticated turns the whitelist off
+select private.set_whitelist(false);
+set role anon;
+\echo EXPECT ERROR: anon calls a hook
+select public.hook_before_user_created('{"user": {"email": "x@x.com"}}');
+reset role;

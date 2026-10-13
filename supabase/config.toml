@@ -288,6 +288,16 @@ max_frequency = "5s"
 # Force log out if the user has been inactive longer than the specified duration.
 # inactivity_timeout = "8h"
 
+# Who may sign up / sign in: see migrations/20261013000000_access_lists.sql. On the hosted
+# project these two hooks are enabled in the dashboard (Authentication → Hooks).
+[auth.hook.before_user_created]
+enabled = true
+uri = "pg-functions://postgres/public/hook_before_user_created"
+
+[auth.hook.custom_access_token]
+enabled = true
+uri = "pg-functions://postgres/public/hook_custom_access_token"
+
 # This hook runs before a new user is created and allows developers to reject the request based on the incoming user object.
 # [auth.hook.before_user_created]
 # enabled = true
