@@ -7,7 +7,6 @@ supabase/config.toml     Supabase CLI config (local dev, auth settings, auth hoo
 supabase/migrations/     schema, RLS, RPCs, triggers, storage policies
 supabase/templates/      auth emails (6-digit codes for sign-up and password reset)
 supabase/tests/          integrity + RLS checks run against a throwaway Postgres
-docs/                    redirects from the old public pages (now on garg-shashwat.github.io/sikka/)
 ```
 
 ## Deploy to a Supabase project
@@ -102,8 +101,6 @@ select whitelist_enabled from private.access_settings;
 ## Public pages
 
 The app's public pages (overview, what's new, privacy policy, terms of use, account deletion) live in the **Sikka section of the developer's site**: https://garg-shashwat.github.io/sikka/ (repo `Garg-Shashwat.github.io`, source in `src/sikka/`). The app links to them from Settings → About.
-
-[docs/](docs/) here only holds redirects from the old addresses (`/Sikka-backend/privacy.html` and `delete-account.html`), which app versions 1.0 and 1.1 still link to. Keep GitHub Pages on for this repo (Settings → Pages → `main` / `/docs`) until those versions are gone.
 
 ## Account deletion
 
